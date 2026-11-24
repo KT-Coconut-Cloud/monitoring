@@ -1,0 +1,276 @@
+groups:
+  # ── 메타 ──────────────────────────────────────────────
+  - name: meta
+    rules:
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+        annotations:
+          summary: "알림 파이프라인 동작 확인용 (항상 발화)"
+
+  # ── 온프렘 수집 끊김 ────────────────────────────────────
+  # remote write 로 받는 구조라 온프렘이 통째로 죽으면 "에러"가 아니라 "데이터 없음"으로 보인다.
+  # 샘플이 끊긴 뒤 약 5분(lookback) 지나야 absent 가 참이 되므로 실제 감지는 5분 + for 이다.
+  - name: onprem-availability
+    rules:
+      - alert: OnpremK3sMetricsMissing
+        expr: absent(up{cluster="onprem-k3s"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "k3s 메트릭이 들어오지 않음 (클러스터/Alloy/네트워크 장애 가능)"
+
+      - alert: OnpremDbPrimaryMetricsMissing
+        expr: absent(up{cluster="onprem-db", role="primary"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DB Primary VM 메트릭이 들어오지 않음"
+
+      - alert: OnpremDbReplicaMetricsMissing
+        expr: absent(up{cluster="onprem-db", role="replica"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DB Replica VM 메트릭이 들어오지 않음"
+
+      - alert: ScrapeTargetDown
+        expr: up{cluster=~"onprem-.*"} == 0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "수집 대상 다운: {{ $labels.job }} ({{ $labels.cluster }} {{ $labels.node }}{{ $labels.host }})"
+
+  # ── k3s ───────────────────────────────────────────────
+  - name: k3s
+    rules:
+      - alert: KubeNodeNotReady
+        expr: kube_node_status_condition{condition="Ready", status="true"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "노드 NotReady: {{ $labels.node }}"
+
+      - alert: PodCrashLooping
+        expr: increase(kube_pod_container_status_restarts_total[15m]) > 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "재시작 반복: {{ $labels.namespace }}/{{ $labels.pod }}"
+
+      - alert: PodNotRunning
+        expr: kube_pod_status_phase{phase=~"Pending|Unknown"} == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "파드가 10분 넘게 {{ $labels.phase }}: {{ $labels.namespace }}/{{ $labels.pod }}"
+
+      # CoreDNS 가 응답하지 않으면 서비스 이름 조회(DB, Argo 등)가 한꺼번에 실패한다
+      - alert: CoreDNSDown
+        expr: up{job="coredns"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CoreDNS 지표 수집 실패 (DNS 장애 가능): {{ $labels.pod }}"
+
+      - alert: CoreDNSServfailHigh
+        expr: |
+          sum(rate(coredns_dns_responses_total{rcode="SERVFAIL"}[5m]))
+            / sum(rate(coredns_dns_responses_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CoreDNS SERVFAIL 비율 5% 초과 (DNS 조회 실패 증가)"
+
+      - alert: ImagePullFailing
+        expr: kube_pod_container_status_waiting_reason{reason=~"ImagePullBackOff|ErrImagePull"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "이미지 풀 실패: {{ $labels.namespace }}/{{ $labels.pod }} (GHCR 인증, 이미지 태그 확인)"
+
+      - alert: PvcNotBound
+        expr: kube_persistentvolumeclaim_status_phase{phase=~"Pending|Lost"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PVC 이상({{ $labels.phase }}): {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }}"
+
+  # ── 파이프라인(Argo Workflows, namespace pii-job) ─────────
+  - name: pipeline
+    rules:
+      # argo_workflows_gauge는 워크플로 객체가 남아 있는 동안 유지된다(삭제/GC되면 해소됨)
+      - alert: PipelineWorkflowFailed
+        expr: sum(argo_workflows_gauge{phase=~"Failed|Error"}) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Argo 워크플로 실패/오류: {{ $value }}건"
+
+      - alert: PipelinePodFailed
+        expr: kube_pod_status_phase{namespace="pii-job",phase="Failed"} == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pii-job 파드 실패: {{ $labels.pod }}"
+
+      # CronWorkflow 스케줄이 확정되면 '마지막 성공 후 경과' 알림을 다시 검토할 것
+      # (Argo는 kube_cronjob_status_last_successful_time에 해당하는 기본 지표가 없다)
+
+  # ── MySQL (DB VM) ─────────────────────────────────────
+  - name: mysql
+    rules:
+      - alert: MySQLDown
+        expr: mysql_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MySQL 다운: {{ $labels.role }} ({{ $labels.host }})"
+
+      - alert: MySQLReplicationBroken
+        expr: mysql_slave_status_slave_io_running == 0 or mysql_slave_status_slave_sql_running == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "복제 스레드 중단: {{ $labels.host }}"
+
+      - alert: MySQLReplicationLag
+        expr: mysql_slave_status_seconds_behind_master > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "복제 지연 {{ $value }}초: {{ $labels.host }}"
+
+  # ── 호스트 / 모니터링 스택 ────────────────────────────────
+  - name: hosts
+    rules:
+      - alert: HostDiskLow
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs"} < 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "디스크 여유 10% 미만: {{ $labels.host }}{{ $labels.node }} {{ $labels.mountpoint }}"
+
+      - alert: HostMemoryLow
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "가용 메모리 10% 미만: {{ $labels.host }}{{ $labels.node }}"
+
+      - alert: HostCpuHigh
+        expr: 100 - avg by (cluster, host, role, instance)(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100 > 90
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU 사용률 90% 초과 (10분 지속): {{ $labels.cluster }} {{ $labels.host }}{{ $labels.role }} {{ $value | printf \"%.0f\" }}%"
+
+      - alert: ContainerMemoryNearLimit
+        expr: |
+          container_memory_working_set_bytes{job="cadvisor-kt", name!=""}
+            / (container_spec_memory_limit_bytes{job="cadvisor-kt", name!=""} > 0) > 0.90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "컨테이너 메모리가 한도의 90% 초과 (재시작될 수 있음): {{ $labels.name }}"
+
+      - alert: PrometheusStorageNearLimit
+        # 기본 보관 한도 PROM_RETENTION_SIZE=10GB 기준. .env에서 값을 바꾸면 이 숫자도 맞춘다.
+        expr: prometheus_tsdb_storage_blocks_bytes > 8.5e9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus 저장 용량이 8.5GB 초과 (보관 한도 10GB)"
+
+      - alert: MonitoringStackDown
+        expr: up{cluster="kt-cloud", job=~"prometheus|loki|grafana|alertmanager"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "모니터링 스택 구성요소 다운: {{ $labels.job }}"
+
+  # ── CI/CD ────────────────────────────────────────────
+  - name: cicd
+    rules:
+      - alert: JenkinsDown
+        expr: up{job="jenkins"} == 0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jenkins 지표를 가져오지 못함 (Jenkins 다운, 플러그인 오류, 방화벽 확인)"
+
+      - alert: JenkinsQueueBacklog
+        expr: default_jenkins_executors_queue_length{job="jenkins"} > 5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jenkins 빌드 대기열 {{ $value }}개가 15분 넘게 쌓임 (실행기 부족 또는 빌드 정체)"
+
+      - alert: JenkinsNoExecutors
+        expr: default_jenkins_executors_online{job="jenkins"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jenkins 온라인 실행기가 없음 (빌드를 돌릴 수 없음)"
+
+  # ── 보안 성격 (지표가 준비되면 채운다) ──────────────────────
+  # Macie 탐지, WireGuard handshake 단절, 허용 외 반출 시도 등은 수집 경로가 정해지면 추가.
+  # 이 그룹의 알림에는 labels.channel: security 를 붙이면 #security 로 간다.
+  - name: security
+    rules:
+      # Vault 는 shamir 수동 언실이라 파드가 재시작되면 봉인된 채로 뜬다. 봉인되면 지표 응답도 실패한다.
+      - alert: VaultDownOrSealed
+        expr: up{job="vault"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          channel: security
+        annotations:
+          summary: "Vault 지표 수집 실패 — 봉인(sealed) 또는 장애 가능: {{ $labels.pod }}"
+
+      - alert: VaultSealed
+        # Vault 지표는 자체 cluster 라벨(vault-cluster-…)이 있어 cluster="onprem-k3s" 로는 걸러지지 않으므로 job 으로 조회한다
+        expr: vault_core_unsealed{job="vault"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          channel: security
+        annotations:
+          summary: "Vault 봉인됨"
+
+      - alert: VaultAuditLogFailure
+        expr: increase(vault_audit_log_request_failure[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          channel: security
+        annotations:
+          summary: "Vault 감사 로그 기록 실패 (요청이 차단될 수 있음): {{ $labels.pod }}"

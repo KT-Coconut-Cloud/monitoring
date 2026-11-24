@@ -1,0 +1,435 @@
+// Alloy — k3s `monitoring` 네임스페이스 (Deployment, replicas 1)
+// 역할: 온프렘 안에서 메트릭/로그를 모아 KT Cloud 로 "밖으로만" 보낸다 (인바운드 없음).
+// 필요한 환경변수: KT_PROM_URL, KT_LOKI_URL, KT_USER, KT_PASS
+//   KT_PROM_URL = https://<KT공인IP>/api/v1/write
+//   KT_LOKI_URL = https://<KT공인IP>/loki/api/v1/push
+
+logging {
+	level  = "info"
+	format = "logfmt"
+}
+
+// ───────────────── 전송 ─────────────────
+
+prometheus.remote_write "kt" {
+	endpoint {
+		url = sys.env("KT_PROM_URL")
+
+		basic_auth {
+			username = sys.env("KT_USER")
+			password = sys.env("KT_PASS")
+		}
+
+		tls_config {
+			ca_file = "/etc/alloy/ca/ca.crt"
+		}
+	}
+
+	external_labels = {
+		cluster = "onprem-k3s",
+	}
+}
+
+loki.write "kt" {
+	endpoint {
+		url = sys.env("KT_LOKI_URL")
+
+		basic_auth {
+			username = sys.env("KT_USER")
+			password = sys.env("KT_PASS")
+		}
+
+		tls_config {
+			ca_file = "/etc/alloy/ca/ca.crt"
+		}
+	}
+
+	external_labels = {
+		cluster = "onprem-k3s",
+	}
+}
+
+// ───────────────── 메트릭 ─────────────────
+
+// 1) kube-state-metrics (Job/CronJob, 파드 상태, PVC, 노드 Ready)
+prometheus.scrape "kube_state_metrics" {
+	job_name        = "kube-state-metrics"
+	targets         = [{__address__ = "kube-state-metrics.monitoring.svc.cluster.local:8080"}]
+	scrape_interval = "30s"
+	forward_to      = [prometheus.remote_write.kt.receiver]
+}
+
+// 2) node-exporter (노드 CPU/메모리/디스크/네트워크) — DaemonSet 파드를 찾아서 긁는다
+discovery.kubernetes "node_exporter" {
+	role = "pod"
+
+	namespaces {
+		names = ["monitoring"]
+	}
+
+	selectors {
+		role  = "pod"
+		label = "app.kubernetes.io/name=prometheus-node-exporter"
+	}
+}
+
+discovery.relabel "node_exporter" {
+	targets = discovery.kubernetes.node_exporter.targets
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_node_name"]
+		target_label  = "node"
+	}
+}
+
+prometheus.scrape "node_exporter" {
+	job_name        = "node-exporter"
+	targets         = discovery.relabel.node_exporter.output
+	scrape_interval = "30s"
+	forward_to      = [prometheus.remote_write.kt.receiver]
+}
+
+// 3) cAdvisor (컨테이너 CPU/메모리) — 각 노드의 kubelet(10250)에서 직접 읽는다.
+//    API 서버 프록시(nodes/proxy 권한)는 쓰지 않는다. 필요한 권한은 nodes/metrics 읽기뿐이다.
+discovery.kubernetes "nodes" {
+	role = "node"
+}
+
+discovery.relabel "cadvisor" {
+	targets = discovery.kubernetes.nodes.targets
+
+	rule {
+		source_labels = ["__meta_kubernetes_node_address_InternalIP"]
+		regex         = "(.+)"
+		replacement   = "${1}:10250"
+		target_label  = "__address__"
+	}
+
+	rule {
+		target_label = "__metrics_path__"
+		replacement  = "/metrics/cadvisor"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_node_name"]
+		target_label  = "node"
+	}
+}
+
+prometheus.scrape "cadvisor" {
+	job_name          = "cadvisor"
+	targets           = discovery.relabel.cadvisor.output
+	scheme            = "https"
+	bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	scrape_interval   = "30s"
+
+	// kubelet 서빙 인증서는 노드 안에서 발급된 것이라 검증을 생략한다 (노드 내부 통신, 토큰 인증).
+	tls_config {
+		insecure_skip_verify = true
+	}
+
+	forward_to = [prometheus.remote_write.kt.receiver]
+}
+
+// 4) Argo CD application-controller (앱 Health/Sync 상태 → argocd_app_info)
+//    파드를 라벨로 찾아 메트릭 포트(8082)를 긁는다. argocd 네임스페이스만 감시한다.
+discovery.kubernetes "argocd" {
+	role = "pod"
+
+	namespaces {
+		names = ["argocd"]
+	}
+
+	selectors {
+		role  = "pod"
+		label = "app.kubernetes.io/name=argocd-application-controller"
+	}
+}
+
+discovery.relabel "argocd" {
+	targets = discovery.kubernetes.argocd.targets
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_ip"]
+		regex         = "(.+)"
+		replacement   = "${1}:8082"
+		target_label  = "__address__"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_name"]
+		target_label  = "pod"
+	}
+}
+
+prometheus.scrape "argocd" {
+	job_name        = "argocd-application-controller"
+	targets         = discovery.relabel.argocd.output
+	scrape_interval = "30s"
+	forward_to      = [prometheus.remote_write.kt.receiver]
+}
+
+// 5) Argo Workflows workflow-controller (워크플로 상태 → argo_workflows_gauge)
+//    컨트롤러 지표 포트(9090)를 긁는다. argo 네임스페이스만 감시한다.
+discovery.kubernetes "argo_workflows" {
+	role = "pod"
+
+	namespaces {
+		names = ["argo"]
+	}
+
+	selectors {
+		role  = "pod"
+		label = "app.kubernetes.io/name=argo-workflows-workflow-controller"
+	}
+}
+
+discovery.relabel "argo_workflows" {
+	targets = discovery.kubernetes.argo_workflows.targets
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_ip"]
+		regex         = "(.+)"
+		replacement   = "${1}:9090"
+		target_label  = "__address__"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_name"]
+		target_label  = "pod"
+	}
+}
+
+prometheus.scrape "argo_workflows" {
+	job_name        = "argo-workflows-controller"
+	targets         = discovery.relabel.argo_workflows.output
+	scheme          = "https"
+	scrape_interval = "30s"
+
+	// 컨트롤러가 자체 서명 인증서로 HTTPS 지표를 내보낸다 (파드 내부 통신, 검증 생략).
+	tls_config {
+		insecure_skip_verify = true
+	}
+
+	forward_to = [prometheus.remote_write.kt.receiver]
+}
+
+// 6) MySQL (Primary / Replica) — 이 Alloy 가 서비스(primary-db, replica-db)로 직접 접속해 읽는다.
+//    DB VM 에 Alloy 를 따로 설치하지 않는다. DSN 은 Secret mysql-monitor 에서 환경변수로 받는다.
+//    알림 규칙이 cluster="onprem-db", role=... 을 보므로 라벨을 바꿔 붙인다.
+prometheus.exporter.mysql "primary" {
+	data_source_name = sys.env("MYSQL_PRIMARY_DSN")
+}
+
+prometheus.exporter.mysql "replica" {
+	data_source_name = sys.env("MYSQL_REPLICA_DSN")
+}
+
+discovery.relabel "mysql_primary" {
+	targets = prometheus.exporter.mysql.primary.targets
+	rule {
+		target_label = "role"
+		replacement  = "primary"
+	}
+}
+
+discovery.relabel "mysql_replica" {
+	targets = prometheus.exporter.mysql.replica.targets
+	rule {
+		target_label = "role"
+		replacement  = "replica"
+	}
+}
+
+prometheus.scrape "mysql_primary" {
+	job_name        = "mysql"
+	targets         = discovery.relabel.mysql_primary.output
+	scrape_interval = "30s"
+	forward_to      = [prometheus.relabel.mysql_db.receiver]
+}
+
+prometheus.scrape "mysql_replica" {
+	job_name        = "mysql"
+	targets         = discovery.relabel.mysql_replica.output
+	scrape_interval = "30s"
+	forward_to      = [prometheus.relabel.mysql_db.receiver]
+}
+
+// remote_write 의 external_labels(cluster=onprem-k3s)는 이미 있는 라벨을 덮어쓰지 않으므로 여기서 먼저 cluster 를 지정한다.
+prometheus.relabel "mysql_db" {
+	rule {
+		target_label = "cluster"
+		replacement  = "onprem-db"
+	}
+	forward_to = [prometheus.remote_write.kt.receiver]
+}
+
+// 7) CoreDNS (클러스터 DNS 요청 수·응답 코드·지연)
+//    kube-system 의 kube-dns 파드 지표 포트(9153)를 긁는다. DNS 장애가 모든 서비스 이름 조회에 영향을 주기 때문.
+discovery.kubernetes "coredns" {
+	role = "pod"
+
+	namespaces {
+		names = ["kube-system"]
+	}
+
+	selectors {
+		role  = "pod"
+		label = "k8s-app=kube-dns"
+	}
+}
+
+discovery.relabel "coredns" {
+	targets = discovery.kubernetes.coredns.targets
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_ip"]
+		regex         = "(.+)"
+		replacement   = "${1}:9153"
+		target_label  = "__address__"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_name"]
+		target_label  = "pod"
+	}
+}
+
+prometheus.scrape "coredns" {
+	job_name        = "coredns"
+	targets         = discovery.relabel.coredns.output
+	scrape_interval = "30s"
+	forward_to      = [prometheus.remote_write.kt.receiver]
+}
+
+// 8) Vault (봉인 여부·요청 수·토큰 수 → vault_core_unsealed 등)
+//    vault 네임스페이스의 Vault 파드(8200, HTTPS)를 긁는다. 지표 조회는 읽기 전용 토큰이 필요하다
+//    (Secret vault-metrics 의 token 키 → 환경변수 VAULT_METRICS_TOKEN).
+//    봉인(sealed) 상태에서는 지표 응답이 실패하므로 up{job="vault"} == 0 이 봉인/장애 신호가 된다.
+discovery.kubernetes "vault" {
+	role = "pod"
+
+	namespaces {
+		names = ["vault"]
+	}
+
+	selectors {
+		role  = "pod"
+		label = "app.kubernetes.io/name=vault"
+	}
+}
+
+discovery.relabel "vault" {
+	targets = discovery.kubernetes.vault.targets
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_ip"]
+		regex         = "(.+)"
+		replacement   = "${1}:8200"
+		target_label  = "__address__"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_name"]
+		target_label  = "pod"
+	}
+}
+
+prometheus.scrape "vault" {
+	job_name        = "vault"
+	targets         = discovery.relabel.vault.output
+	metrics_path    = "/v1/sys/metrics"
+	params          = {"format" = ["prometheus"]}
+	scheme          = "https"
+	scrape_interval = "30s"
+
+	authorization {
+		type        = "Bearer"
+		credentials = sys.env("VAULT_METRICS_TOKEN")
+	}
+
+	// Vault 가 사설 인증서를 쓰고 접속 주소가 파드 IP 라서 검증을 생략한다 (클러스터 내부 통신).
+	// 나중에 vault-ca 로 검증하도록 바꿀 수 있다.
+	tls_config {
+		insecure_skip_verify = true
+	}
+
+	forward_to = [prometheus.remote_write.kt.receiver]
+}
+
+// ───────────────── 로그 ─────────────────
+
+discovery.kubernetes "pods" {
+	role = "pod"
+
+	// 로그를 읽을 네임스페이스만 감시한다 (노드 메모리·API 서버 부담을 줄이기 위함).
+	// 수집할 곳이 늘어나면 여기에 추가한다.
+	namespaces {
+		names = ["pii-job", "app"]
+	}
+}
+
+discovery.relabel "pods" {
+	targets = discovery.kubernetes.pods.targets
+
+	// 시스템 네임스페이스는 수집하지 않는다
+	rule {
+		source_labels = ["__meta_kubernetes_namespace"]
+		regex         = "kube-system|kube-public|kube-node-lease"
+		action        = "drop"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_namespace"]
+		target_label  = "namespace"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_name"]
+		target_label  = "pod"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_container_name"]
+		target_label  = "container"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+		target_label  = "app"
+	}
+}
+
+loki.source.kubernetes "pods" {
+	targets    = discovery.relabel.pods.output
+	forward_to = [loki.process.mask.receiver]
+}
+
+// 외부(KT Cloud)로 나가기 전 마지막 관문
+loki.process "mask" {
+	// pii-job 은 단계 이벤트 줄(pipeline_stage 포함, JSON 한 줄)만 통과시키고 나머지는 버린다
+	stage.match {
+		selector = "{namespace=\"pii-job\"} !~ \"pipeline_stage\""
+		action   = "drop"
+	}
+
+	// 주민등록번호 (6자리-7자리)
+	stage.replace {
+		expression = "(\\d{6}[- ]?[1-4]\\d{6})"
+		replace    = "[RRN]"
+	}
+
+	// 휴대폰 번호
+	stage.replace {
+		expression = "(01[016789][- ]?\\d{3,4}[- ]?\\d{4})"
+		replace    = "[PHONE]"
+	}
+
+	// 이메일
+	stage.replace {
+		expression = "([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,})"
+		replace    = "[EMAIL]"
+	}
+
+	forward_to = [loki.write.kt.receiver]
+}

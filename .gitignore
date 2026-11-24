@@ -1,0 +1,7 @@
+.env
+caddy/certs/*
+!caddy/certs/.gitkeep
+caddy/ca/*
+!caddy/ca/.gitkeep
+alertmanager/secrets/*
+!alertmanager/secrets/.gitkeep

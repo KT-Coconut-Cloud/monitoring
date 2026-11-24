@@ -1,0 +1,60 @@
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    monitor: kt-monitoring
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+# 온프렘(k3s, DB VM) 메트릭은 Alloy가 remote write 로 보내므로 여기엔 없다.
+# 아래는 이 VM 안에서 직접 긁는 대상이다.
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels: {cluster: kt-cloud}
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+        labels: {cluster: kt-cloud}
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+        labels: {cluster: kt-cloud}
+
+  - job_name: grafana
+    static_configs:
+      - targets: ["grafana:3000"]
+        labels: {cluster: kt-cloud}
+
+  - job_name: node-exporter-kt
+    static_configs:
+      - targets: ["host.docker.internal:9100"]
+        labels: {cluster: kt-cloud, host: kt-monitoring-vm}
+
+  - job_name: cadvisor-kt
+    static_configs:
+      - targets: ["cadvisor:8080"]
+        labels: {cluster: kt-cloud, host: kt-monitoring-vm}
+
+  # Jenkins (CI 서버 VM). Prometheus 플러그인이 /prometheus 로 지표를 내보낸다.
+  # 인증 없음, Jenkins 쪽 방화벽이 모니터링 VM 공인 IP 만 허용한다 (CI/CD 담당 확인 완료).
+  - job_name: jenkins
+    metrics_path: /prometheus
+    static_configs:
+      - targets: ["211.252.85.148:8080"]
+        labels: {cluster: kt-cloud, host: kt-jenkins-vm}
+
+  # Jenkins VM 호스트 자원(CPU·메모리·디스크)도 보려면 node-exporter 를 올리고 아래를 채운다.
+  # - job_name: node-exporter-jenkins
+  #   static_configs:
+  #     - targets: ["<JENKINS_VM_IP>:9100"]
+  #       labels: {cluster: kt-cloud, host: kt-jenkins-vm}

@@ -1,0 +1,27 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+
+  # CloudWatch: 읽기 전용 IAM 키가 준비되면 주석을 풀고 값을 넣는다.
+  # 키는 이 파일에 직접 적지 말고 환경변수로 주입하는 방식을 권장.
+  - name: CloudWatch
+    uid: cloudwatch
+    type: cloudwatch
+    jsonData:
+      authType: keys
+      defaultRegion: ap-northeast-2
+    secureJsonData:
+      accessKey: ${CW_ACCESS_KEY}
+      secretKey: ${CW_SECRET_KEY}

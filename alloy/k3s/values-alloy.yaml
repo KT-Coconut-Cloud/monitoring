@@ -1,0 +1,68 @@
+# grafana/alloy Helm 차트 values (monitoring 네임스페이스, Deployment 1개)
+#   helm repo add grafana https://grafana.github.io/helm-charts
+#   helm upgrade --install alloy grafana/alloy -n monitoring -f values-alloy.yaml
+#
+# 먼저 만들어 둘 것 (README 참고):
+#   ConfigMap alloy-config  (config.alloy)
+#   ConfigMap kt-ca         (ca.crt)
+#   Secret    kt-ingest     (prom_url, loki_url, user, pass)
+#   Secret    mysql-monitor (primary_dsn, replica_dsn)
+#   Secret    vault-metrics (token)
+
+controller:
+  type: deployment
+  replicas: 1
+  volumes:
+    extra:
+      - name: kt-ca
+        configMap:
+          name: kt-ca
+
+alloy:
+  configMap:
+    create: false
+    name: alloy-config
+    key: config.alloy
+
+  mounts:
+    extra:
+      - name: kt-ca
+        mountPath: /etc/alloy/ca
+        readOnly: true
+
+  extraEnv:
+    - name: KT_PROM_URL
+      valueFrom:
+        secretKeyRef: {name: kt-ingest, key: prom_url}
+    - name: KT_LOKI_URL
+      valueFrom:
+        secretKeyRef: {name: kt-ingest, key: loki_url}
+    - name: KT_USER
+      valueFrom:
+        secretKeyRef: {name: kt-ingest, key: user}
+    - name: KT_PASS
+      valueFrom:
+        secretKeyRef: {name: kt-ingest, key: pass}
+    # MySQL 모니터링 계정 DSN (Secret mysql-monitor: primary_dsn, replica_dsn)
+    - name: MYSQL_PRIMARY_DSN
+      valueFrom:
+        secretKeyRef: {name: mysql-monitor, key: primary_dsn}
+    - name: MYSQL_REPLICA_DSN
+      valueFrom:
+        secretKeyRef: {name: mysql-monitor, key: replica_dsn}
+    # Vault 지표 조회용 읽기 전용 토큰 (Secret vault-metrics: token)
+    - name: VAULT_METRICS_TOKEN
+      valueFrom:
+        secretKeyRef: {name: vault-metrics, key: token}
+    # Go 메모리 사용량이 limits 를 넘지 않도록 미리 정리하게 한다
+    - name: GOMEMLIMIT
+      value: 400MiB
+
+  # 노드 RAM 증설(11.6GB) 후 상향. 256Mi 일 때 한도에 붙어 GC/페이지 폴트로 CPU 포화가 났다(2026-11-23).
+  resources:
+    requests: {cpu: 30m, memory: 96Mi}
+    limits: {memory: 512Mi}
+
+# 설정 변경을 감지하는 보조 컨테이너는 쓰지 않는다 (설정을 바꾸면 파드를 재시작한다)
+configReloader:
+  enabled: false

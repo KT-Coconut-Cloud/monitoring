@@ -1,0 +1,32 @@
+# Discord 웹훅 URL 은 파일로 주입한다 (README 참고). webhook_url_file 은 v0.28.1 에서
+# amtool 로 확인했고, v0.27.0 에서는 지원되지 않는다.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: discord-alerts
+  group_by: [alertname, cluster, namespace]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Watchdog 는 "항상 발화" 용도라 어디로도 보내지 않는다
+    - matchers: [alertname="Watchdog"]
+      receiver: "null"
+    # 보안 성격 알림은 #security 채널로
+    - matchers: [channel="security"]
+      receiver: discord-security
+      repeat_interval: 1h
+
+receivers:
+  - name: "null"
+
+  - name: discord-alerts
+    discord_configs:
+      - webhook_url_file: /etc/alertmanager/secrets/discord_alerts
+        send_resolved: true
+
+  - name: discord-security
+    discord_configs:
+      - webhook_url_file: /etc/alertmanager/secrets/discord_security
+        send_resolved: true

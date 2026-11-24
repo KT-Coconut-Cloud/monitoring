@@ -1,0 +1,80 @@
+# monitoring 네임스페이스 egress 제한 (초안)
+# <...> 값은 실제 값으로 바꿔서 쓴다. 배포하면서 막히는 통신이 있으면 항목을 추가한다.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: monitoring-egress
+  namespace: monitoring
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    # monitoring 네임스페이스 내부 (kube-state-metrics 등)
+    - to:
+        - podSelector: {}
+    # kube-apiserver (서비스 디스커버리, 로그 읽기)
+    - to:
+        - ipBlock:
+            cidr: "<APISERVER_NODE_IP>/32"
+      ports:
+        - {protocol: TCP, port: 6443}
+    # node-exporter(9100), kubelet cAdvisor(10250) — 둘 다 노드 IP 로 접근
+    - to:
+        - ipBlock:
+            cidr: "<NODE_CIDR>"
+      ports:
+        - {protocol: TCP, port: 9100}
+        - {protocol: TCP, port: 10250}
+    # Argo CD application-controller(8082), Argo Workflows controller(9090) — 파드 IP 로 직접 접근
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: argocd
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-application-controller
+      ports:
+        - {protocol: TCP, port: 8082}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: argo
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: argo-workflows-workflow-controller
+      ports:
+        - {protocol: TCP, port: 9090}
+    # CoreDNS(9153) — 파드 IP 로 직접 접근
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: TCP, port: 9153}
+    # Vault(8200, HTTPS) — 파드 IP 로 직접 접근
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vault
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: vault
+      ports:
+        - {protocol: TCP, port: 8200}
+    # KT Cloud 모니터링 서버 (전송)
+    - to:
+        - ipBlock:
+            cidr: "<KT_PUBLIC_IP>/32"
+      ports:
+        - {protocol: TCP, port: 443}
